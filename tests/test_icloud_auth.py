@@ -31,6 +31,7 @@ class FakeBackend:
 
     def login(self, password, staging):
         self.passwords.append(password)
+        self.seen_in_staging = sorted(p.name for p in staging.iterdir())
         if self.fail_login:
             raise RuntimeError("upstream said: bad password " + password)  # must not leak
         (staging / "userexamplecom.session").write_text(json.dumps({"session_token": "synthetic"}))
@@ -197,6 +198,29 @@ def test_failed_login_kills_token_and_hides_upstream_error(tmp_path):
         assert list((tmp_path / "staging").iterdir()) == []
         logs = stderr.getvalue()
     assert MARKER not in logs and "RuntimeError" in logs
+
+
+def test_staging_is_seeded_from_live_session(tmp_path):
+    backend = FakeBackend()
+    with running(backend, tmp_path) as (svc, wport, mport, _):
+        live = tmp_path / "live"
+        (live / "userexamplecom.session").write_text(json.dumps({"trust_token": "synthetic-trust"}))
+        (live / "userexamplecom.cookiejar").write_text("#LWP-Cookies-2.0\n")
+        (live / "mcp-receipts").mkdir()
+        path = start_link(mport)
+        _, cookie = open_link(wport, path)
+        post(wport, path, cookie, password=MARKER)
+        assert backend.seen_in_staging == ["userexamplecom.cookiejar", "userexamplecom.session"]
+        assert json.loads((live / "userexamplecom.session").read_text()) == {"trust_token": "synthetic-trust"}
+
+
+def test_staging_empty_without_live_session(tmp_path):
+    backend = FakeBackend()
+    with running(backend, tmp_path) as (svc, wport, mport, _):
+        path = start_link(mport)
+        _, cookie = open_link(wport, path)
+        post(wport, path, cookie, password=MARKER)
+        assert backend.seen_in_staging == []
 
 
 def test_three_wrong_codes_fail(tmp_path):

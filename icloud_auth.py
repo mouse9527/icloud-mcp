@@ -260,6 +260,14 @@ class AuthService:
         base.mkdir(mode=0o700, exist_ok=True)
         path = base / secrets.token_hex(8)
         path.mkdir(mode=0o700)
+        # Seed with the current session so pyicloud sends the stored trust_token
+        # ("trust this browser"); Apple then skips 2FA while that trust is valid.
+        live = self.root / "live"
+        if live.is_dir():
+            for src in live.iterdir():
+                if src.is_file() and src.name.endswith((".session", ".cookiejar")):
+                    shutil.copyfile(src, path / src.name)
+                    os.chmod(path / src.name, 0o600)
         return path
 
 
