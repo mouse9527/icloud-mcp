@@ -80,9 +80,10 @@ command: ["/opt/reminders/bin/python", "/opt/icloud/icloud_auth.py"]
 | `ICLOUD_AUTH_PUBLIC_BASE` | yes | public base URL of the login page (no trailing path) |
 | `ICLOUD_AUTH_MCP_ALLOWED_HOSTS` | yes | `Host` allowlist for the MCP port |
 | `ICLOUD_AUTH_WEB_PORT` / `ICLOUD_AUTH_MCP_PORT` | no | default `8000` / `8001` |
+| `ICLOUD_AUTH_DONE_URL` | no | after a successful login the page tries `window.close()` and, 2 s later, navigates here (e.g. the chat UI). Unset: shows "you can close this page" |
 | `ICLOUD_CHINA` | China only | `1` |
 
-Expose port 8000 (login page) to the user's browser through your ingress;
+Expose port 8000 (login page) to the user's browser through your ingress (for SSE: disable response buffering and allow long reads, e.g. ingress-nginx `proxy-buffering: "off"`, `proxy-read-timeout: "960"`);
 expose 8001 (MCP) only to the MCP client. The login port does not hold the
 Apple ID app-specific password.
 
@@ -91,13 +92,16 @@ Apple ID app-specific password.
 1. A Reminders tool returns `authentication_required` with the hint "call `icloud_login_start`".
 2. The model calls `icloud_login_start` → `{url, expires_in_seconds: 300}`. A new link replaces any earlier one.
 3. The user opens the link on their phone: password field (password manager fills it) → 6-digit code if asked → approve "allow iCloud data access" on a device if asked.
+   The page is a single static HTML page. A password POST returns at once (204) and the whole Apple conversation runs in a worker thread; state changes are pushed over **server-sent events** (`GET /<user>/<token>/events`, same token + cookie checks, a heartbeat comment every 15 s). There is no meta refresh and no polling.
+   pyicloud requests the 2FA prompt from inside `authenticate()` and then blocks up to 30 s on the trusted-device bridge even though the iPhone already shows the code; icloud-auth swaps `request_2fa_code` on the PyiCloudService *instance* so the code form appears as soon as pyicloud decides a code is needed. A code typed before the bridge is ready is queued and submitted when it is.
+   States: `link → signing_in → code → verifying → approve → done | failed`. Failures are classified (wrong password / 3 wrong codes / timeout / unsupported account / Apple refused) with fixed copy; no upstream text reaches the page.
 4. The session is written to `staging/`, renamed to `incoming/`, `READY` created last. Before its next request the Reminders wrapper drops the old in-memory client (so it can no longer rewrite the old files) and moves the new files into `live/`.
 5. The model calls `icloud_login_status`, then retries. No restart.
 
-Hardening: without a pending token every path on the login port is 404;
+Hardening: without a pending token every path on the login port is 404 (one generic "link expired" page, identical for unknown, used and expired links);
 links are single-use and expire after 5 minutes; the first visit sets a
 binding cookie (a leaked URL cannot be continued from another browser); one
-password attempt per link; at most 3 code attempts; Python logging is disabled
+password attempt per link; at most 3 code attempts; CSP allows only the page's own nonce'd inline script and same-origin connections; Python logging is disabled
 and access logs mask the token; tool results never contain the token.
 
 ## Development
@@ -119,6 +123,8 @@ docker build --platform linux/amd64 .
 - Not supported: security-key (FIDO) accounts, legacy two-step verification, urgent alarms, location reminders, tags, attachments, editing lists. Date-only reminders get no timed alert.
 - The session lives in the shared directory; recreating the Pod with an `emptyDir` means logging in again. Idempotency receipts are stored there too.
 - One replica only: a session must be used by a single Reminders worker.
+- `window.close()` only works for tabs opened by script; Safari usually ignores it for a link opened from a chat app, so `ICLOUD_AUTH_DONE_URL` is the reliable way back.
+- The early code form relies on pyicloud calling `self.request_2fa_code()` from `_srp_authentication` (pinned `86c4bc90`); a unit test pins that contract — re-check it when upgrading pyicloud.
 
 ## License
 
