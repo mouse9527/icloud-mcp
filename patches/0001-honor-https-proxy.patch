@@ -1,0 +1,48 @@
+diff --git a/cmd/icloud-mcp/main.go b/cmd/icloud-mcp/main.go
+index b63faac..9d668b7 100644
+--- a/cmd/icloud-mcp/main.go
++++ b/cmd/icloud-mcp/main.go
+@@ -115,7 +115,7 @@ func main() {
+ 	}
+ 	httpClient := security.NewICloudHTTPClient(cfg.Timeout)
+ 	if remote != nil {
+-		httpClient.Transport = security.NewAllowlistTransport(&http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13}, MaxConnsPerHost: 10, IdleConnTimeout: 30 * time.Second}, security.IsICloudHost)
++		httpClient.Transport = security.NewAllowlistTransport(&http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13}, MaxConnsPerHost: 10, IdleConnTimeout: 30 * time.Second}, security.IsICloudHost)
+ 	}
+ 	authHTTP := webdav.HTTPClientWithBasicAuth(httpClient, calendarCredentials.Username, calendarCredentials.Password)
+ 	doer := icloud.NewRetryClassifier(authHTTP)
+diff --git a/internal/security/allowlist.go b/internal/security/allowlist.go
+index 52fd75d..ec54587 100644
+--- a/internal/security/allowlist.go
++++ b/internal/security/allowlist.go
+@@ -119,10 +119,10 @@ func NewContactsHTTPClient(timeout time.Duration) *http.Client {
+ 
+ func newDAVTransport(allowed func(string) bool) *AllowlistTransport {
+ 	inner := &http.Transport{
+-		// Explicit nil: never honor HTTP(S)_PROXY. The allowlist is the only
+-		// egress path; an env proxy would surprise operators and widen the
+-		// trust boundary to a local MITM.
+-		Proxy:           nil,
++		// icloud-mcp patch: the Pod's only egress is an HTTP CONNECT proxy, so
++		// honor HTTPS_PROXY. TLS stays end-to-end (CONNECT tunnel) and the
++		// allowlist still checks the target host of every request.
++		Proxy:           http.ProxyFromEnvironment,
+ 		MaxIdleConns:    10,
+ 		MaxConnsPerHost: 10,
+ 		IdleConnTimeout: 30 * time.Second,
+diff --git a/internal/security/allowlist_test.go b/internal/security/allowlist_test.go
+index f0747c1..05fb914 100644
+--- a/internal/security/allowlist_test.go
++++ b/internal/security/allowlist_test.go
+@@ -248,8 +248,9 @@ func TestDAVClientsUseSeparateDomainTransports(t *testing.T) {
+ 		if !ok {
+ 			t.Fatalf("%s inner transport type = %T", name, allowlist.inner)
+ 		}
+-		if inner.Proxy != nil {
+-			t.Errorf("%s transport must not use an environment proxy", name)
++		// icloud-mcp patch: the environment proxy is honored on purpose.
++		if inner.Proxy == nil {
++			t.Errorf("%s transport must honor HTTPS_PROXY", name)
+ 		}
+ 		if inner.TLSClientConfig == nil || inner.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+ 			t.Errorf("%s transport does not require TLS 1.2", name)

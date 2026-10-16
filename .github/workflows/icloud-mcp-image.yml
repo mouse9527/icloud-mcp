@@ -1,0 +1,120 @@
+# icloud-mcp 镜像
+# - 文档以外的文件变更时构建；任意分支 push 都构建并推送（只推不可变 tag），合并前就能验证
+# - linux/amd64 → ghcr.io/mouse9527/icloud-mcp
+# - tag：sha-<短 sha>、up-c027fd7-sha-<短 sha>（上游 pin 版本 + 本仓库 commit）；不打 latest
+# - 第三方 action 全部 pin commit SHA
+name: icloud-mcp-image
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: icloud-mcp-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/mouse9527/icloud-mcp
+  UPSTREAM: c027fd7
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 离线测试（auth 登录页 / reload 包装），不需要 Apple 账号
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: offline tests
+        run: |
+          git clone --quiet https://github.com/tomernation/icloud-mcp.git /tmp/upstream
+          git -C /tmp/upstream checkout --quiet --detach c027fd74c3f1e8435313830b70adcc63bad898ca
+          python -m pip install --quiet pytest
+          UPSTREAM_SCRIPTS=/tmp/upstream/scripts python -m pytest -q -p no:cacheprovider tests/
+
+      - name: tags
+        id: meta
+        run: |
+          short="${GITHUB_SHA::7}"
+          echo "tags=${IMAGE}:sha-${short},${IMAGE}:up-${UPSTREAM}-sha-${short}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Dockerfile 里的 builder 阶段会跑上游全量 go vet / go test（含补丁测试）
+      # 先 load 到本地做内容审计，审计通过再推送（镜像要设为 public）
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          pull: true
+          load: true
+          tags: icloud-mcp:audit
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 证明镜像里没有凭据 / session / .git：导出文件系统，列清单并扫敏感特征，结果作为 artifact 留证
+      - name: audit image content
+        run: |
+          set -euo pipefail
+          mkdir -p audit rootfs
+          docker history --no-trunc --format '{{.CreatedBy}}' icloud-mcp:audit > audit/history.txt
+          docker inspect icloud-mcp:audit --format '{{json .Config.Env}}' > audit/env.json
+          cid=$(docker create icloud-mcp:audit)
+          docker export "$cid" | tar -x -C rootfs
+          docker rm "$cid" >/dev/null
+          (cd rootfs && find . -xdev -type f | sort) > audit/files.txt
+          wc -l < audit/files.txt
+          # 1) 不应存在的文件（阻断）
+          (cd rootfs && find . -xdev \( -name '*.session' -o -name '*.cookiejar' -o -name '.git' -o -name '*.key' -o -name 'id_rsa*' -o -name '.env' -o -name '.netrc' -o -name '.git-credentials' -o -path './opt/icloud/tests*' \) -print) > audit/forbidden-files.txt
+          # 私钥内容（真私钥 = BEGIN 行后紧跟 base64 正文）
+          KEYRE='-----BEGIN [A-Z ]*PRIVATE KEY-----\r?\n[A-Za-z0-9+/=]{40,}\r?\n'
+          #   阻断：只扫我们控制的路径
+          (cd rootfs && for d in ./opt/icloud ./icloud-mcp ./root ./home ./tmp ./etc; do [ -e "$d" ] && echo "$d"; done \
+            | xargs -r grep -rlIPz --exclude-dir=certs -e "$KEYRE" 2>/dev/null | tr '\0' '\n' || true) >> audit/forbidden-files.txt
+          #   只留档、不阻断：系统库 / site-packages / 公共 CA（第三方包自带的测试或内置文本）
+          (cd rootfs && grep -rlPz --exclude-dir=proc -e "$KEYRE" ./usr ./opt/reminders ./etc/ssl 2>/dev/null | tr '\0' '\n' || true) > audit/thirdparty-key-like.txt
+          (cd rootfs && find . -xdev -name '*.pem' | sort) > audit/pem-files.txt   # 留档：只应是 CA 根证书
+          # 2) 构建历史 / ENV 里不应出现凭据类字样
+          grep -inE 'password|secret|token|apple_?id|@icloud\.com|@me\.com' audit/history.txt audit/env.json > audit/suspicious-config.txt || true
+          # 3) 我们自己加的文件全文
+          ls -la rootfs/opt/icloud > audit/opt-icloud.txt
+          sha256sum rootfs/opt/icloud/*.py rootfs/icloud-mcp >> audit/opt-icloud.txt
+          echo "--- forbidden:"; cat audit/forbidden-files.txt
+          echo "--- suspicious config:"; cat audit/suspicious-config.txt
+          echo "--- third-party key-like (record only):"; cat audit/thirdparty-key-like.txt
+          test ! -s audit/forbidden-files.txt
+          test ! -s audit/suspicious-config.txt
+          echo "audit ok"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: icloud-mcp-image-audit
+          path: audit/
+          retention-days: 90
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha

@@ -1,0 +1,223 @@
+diff --git a/cmd/icloud-mcp/remote.go b/cmd/icloud-mcp/remote.go
+index a66f9dd..7e786b6 100644
+--- a/cmd/icloud-mcp/remote.go
++++ b/cmd/icloud-mcp/remote.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"context"
++	"crypto/subtle"
+ 	"crypto/tls"
+ 	"encoding/json"
+ 	"errors"
+@@ -22,12 +23,56 @@ import (
+ type remoteConfig struct {
+ 	address, resource, issuer, introspection, owner, clientID, secret, cert, key string
+ 	client                                                                       *http.Client
++	// icloud-mcp patch: plain HTTP behind a NetworkPolicy, optional static bearer.
++	plain        bool
++	allowedHosts map[string]bool
++	bearer       string
++}
++
++// loadPlainConfig serves cleartext HTTP for a private cluster network where
++// TLS and identity are enforced in front of this process (NetworkPolicy plus
++// the MCP client's own access control). It never falls back silently: it is
++// selected only by MCP_PLAIN_HTTP=true and requires an explicit Host allowlist.
++func loadPlainConfig(address string) (*remoteConfig, error) {
++	c := &remoteConfig{address: address, plain: true, allowedHosts: map[string]bool{}}
++	for _, h := range strings.Split(os.Getenv("MCP_ALLOWED_HOSTS"), ",") {
++		if h = strings.TrimSpace(h); h != "" {
++			c.allowedHosts[h] = true
++		}
++	}
++	if len(c.allowedHosts) == 0 {
++		return nil, errors.New("MCP_PLAIN_HTTP requires MCP_ALLOWED_HOSTS")
++	}
++	if path := os.Getenv("MCP_BEARER_TOKEN_FILE"); path != "" {
++		b, e := os.ReadFile(path)
++		if e != nil || len(b) > 4096 {
++			return nil, errors.New("cannot read MCP bearer token file")
++		}
++		if c.bearer = strings.TrimSpace(string(b)); c.bearer == "" {
++			return nil, errors.New("empty MCP bearer token")
++		}
++	}
++	return c, nil
++}
++
++func (c *remoteConfig) authorizePlain(r *http.Request) int {
++	if c.bearer == "" {
++		return 0
++	}
++	h := r.Header.Values("Authorization")
++	if len(h) != 1 || subtle.ConstantTimeCompare([]byte(h[0]), []byte("Bearer "+c.bearer)) != 1 {
++		return http.StatusUnauthorized
++	}
++	return 0
+ }
+ 
+ func loadRemoteConfig(address string) (*remoteConfig, error) {
+ 	if address == "" {
+ 		return nil, nil
+ 	}
++	if os.Getenv("MCP_PLAIN_HTTP") == "true" {
++		return loadPlainConfig(address)
++	}
+ 	c := &remoteConfig{address: address, resource: os.Getenv("MCP_RESOURCE"), issuer: os.Getenv("MCP_ISSUER"), introspection: os.Getenv("MCP_INTROSPECTION_URL"), owner: os.Getenv("MCP_OWNER_SUB"), clientID: os.Getenv("MCP_INTROSPECTION_CLIENT_ID"), cert: os.Getenv("MCP_TLS_CERT"), key: os.Getenv("MCP_TLS_KEY")}
+ 	for _, value := range []string{c.resource, c.issuer, c.introspection} {
+ 		u, e := url.Parse(value)
+@@ -131,6 +176,9 @@ func (c *remoteConfig) authorize(r *http.Request) int {
+ 
+ func remoteHandler(s *server.MCPServer, c *remoteConfig) http.Handler {
+ 	transport := server.NewStreamableHTTPServer(s, server.WithStateLess(true), server.WithDisableStreaming(true))
++	if c.plain {
++		return plainHandler(transport, c)
++	}
+ 	u, _ := url.Parse(c.resource)
+ 	metadata := u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource"
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -182,8 +230,47 @@ func remoteHandler(s *server.MCPServer, c *remoteConfig) http.Handler {
+ 	})
+ }
+ 
++func plainHandler(transport http.Handler, c *remoteConfig) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Cache-Control", "no-store")
++		if !c.allowedHosts[r.Host] {
++			http.Error(w, "invalid host", 403)
++			return
++		}
++		// Server-to-server clients send no Origin; any browser origin is refused.
++		if r.Header.Get("Origin") != "" {
++			http.Error(w, "invalid origin", 403)
++			return
++		}
++		switch r.URL.Path {
++		case "/healthz":
++			if r.Method != http.MethodGet {
++				w.WriteHeader(405)
++				return
++			}
++			w.Header().Set("Content-Type", "application/json")
++			io.WriteString(w, `{"status":"ok"}`)
++		case "/mcp":
++			if r.Method != http.MethodPost && r.Method != http.MethodGet && r.Method != http.MethodDelete {
++				w.WriteHeader(405)
++				return
++			}
++			if status := c.authorizePlain(r); status != 0 {
++				http.Error(w, http.StatusText(status), status)
++				return
++			}
++			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
++			transport.ServeHTTP(w, r)
++		default:
++			http.NotFound(w, r)
++		}
++	})
++}
++
+ func serveRemote(s *server.MCPServer, c *remoteConfig) error {
+-	srv := &http.Server{Addr: c.address, Handler: remoteHandler(s, c), TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
++	// Reminders tools may run for 120s (CloudKit device approval), so the
++	// write deadline must exceed that (upstream 35s only fits Calendar).
++	srv := &http.Server{Addr: c.address, Handler: remoteHandler(s, c), TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
+ 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 	defer stop()
+ 	done := make(chan struct{})
+@@ -197,7 +284,12 @@ func serveRemote(s *server.MCPServer, c *remoteConfig) error {
+ 		case <-done:
+ 		}
+ 	}()
+-	err := srv.ListenAndServeTLS(c.cert, c.key)
++	var err error
++	if c.plain {
++		err = srv.ListenAndServe()
++	} else {
++		err = srv.ListenAndServeTLS(c.cert, c.key)
++	}
+ 	if errors.Is(err, http.ErrServerClosed) {
+ 		return nil
+ 	}
+diff --git a/cmd/icloud-mcp/remote_plain_test.go b/cmd/icloud-mcp/remote_plain_test.go
+new file mode 100644
+index 0000000..872f924
+--- /dev/null
++++ b/cmd/icloud-mcp/remote_plain_test.go
+@@ -0,0 +1,75 @@
++package main
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/ThomasCrouzet/icloud-mcp/internal/security"
++	"github.com/mark3labs/mcp-go/mcp"
++)
++
++func TestPlainRemote(t *testing.T) {
++	dir := t.TempDir()
++	tokenFile := filepath.Join(dir, "token")
++	os.WriteFile(tokenFile, []byte("synthetic-bearer\n"), 0o600)
++	t.Setenv("MCP_PLAIN_HTTP", "true")
++	t.Setenv("MCP_ALLOWED_HOSTS", "mcp.internal:8080, mcp:8080")
++	t.Setenv("MCP_BEARER_TOKEN_FILE", tokenFile)
++	c, err := loadRemoteConfig(":8080")
++	if err != nil || !c.plain || c.bearer != "synthetic-bearer" || !c.allowedHosts["mcp:8080"] {
++		t.Fatalf("plain config: %v %+v", err, c)
++	}
++	s := newMCPServer(security.NewRedactor())
++	s.AddTool(mcp.NewTool("fixture"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++		return mcp.NewToolResultText("synthetic-result"), nil
++	})
++	h := remoteHandler(s, c)
++	do := func(host, auth, origin, path string) *httptest.ResponseRecorder {
++		r := httptest.NewRequest("POST", "http://"+host+path, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fixture","arguments":{}}}`))
++		r.Header.Set("Content-Type", "application/json")
++		r.Header.Set("Accept", "application/json, text/event-stream")
++		if auth != "" {
++			r.Header.Set("Authorization", auth)
++		}
++		if origin != "" {
++			r.Header.Set("Origin", origin)
++		}
++		w := httptest.NewRecorder()
++		h.ServeHTTP(w, r)
++		return w
++	}
++	if w := do("mcp.internal:8080", "Bearer synthetic-bearer", "", "/mcp"); w.Code != 200 || !strings.Contains(w.Body.String(), "synthetic-result") {
++		t.Fatalf("authorized call: %d %s", w.Code, w.Body)
++	}
++	cases := []struct {
++		host, auth, origin, path string
++		want                     int
++	}{
++		{"evil:8080", "Bearer synthetic-bearer", "", "/mcp", 403},
++		{"mcp:8080", "", "", "/mcp", 401},
++		{"mcp:8080", "Bearer wrong", "", "/mcp", 401},
++		{"mcp:8080", "Bearer synthetic-bearer", "http://evil", "/mcp", 403},
++		{"mcp:8080", "Bearer synthetic-bearer", "", "/other", 404},
++	}
++	for _, tc := range cases {
++		if w := do(tc.host, tc.auth, tc.origin, tc.path); w.Code != tc.want {
++			t.Errorf("%+v: got %d", tc, w.Code)
++		}
++	}
++	r := httptest.NewRequest("GET", "http://mcp:8080/healthz", nil)
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if w.Code != 200 {
++		t.Errorf("healthz %d", w.Code)
++	}
++	t.Setenv("MCP_ALLOWED_HOSTS", "")
++	if _, err := loadRemoteConfig(":8080"); err == nil {
++		t.Error("plain mode without host allowlist must fail")
++	}
++	_ = http.StatusOK
++}

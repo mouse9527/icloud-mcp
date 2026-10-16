@@ -1,0 +1,152 @@
+diff --git a/cmd/icloud-mcp/main.go b/cmd/icloud-mcp/main.go
+index 9d668b7..793b353 100644
+--- a/cmd/icloud-mcp/main.go
++++ b/cmd/icloud-mcp/main.go
+@@ -119,7 +119,11 @@ func main() {
+ 	}
+ 	authHTTP := webdav.HTTPClientWithBasicAuth(httpClient, calendarCredentials.Username, calendarCredentials.Password)
+ 	doer := icloud.NewRetryClassifier(authHTTP)
+-	ic := icloud.NewClient(doer, security.ICloudBaseURL, security.IsICloudHost)
++	calendarBase, err := security.CalDAVBaseURL()
++	if err != nil {
++		log.Fatalf("configuration error: %v", err)
++	}
++	ic := icloud.NewClient(doer, calendarBase, security.IsICloudHost)
+ 	contactsService, mailService, err := newOptionalServices(cfg)
+ 	if err == nil {
+ 		err = runServerWithRemote(cfg, auditFormat, *healthAddr, ic, contactsService, mailService, os.Stdin, os.Stdout, remote)
+diff --git a/internal/security/allowlist.go b/internal/security/allowlist.go
+index ec54587..348ba93 100644
+--- a/internal/security/allowlist.go
++++ b/internal/security/allowlist.go
+@@ -8,6 +8,7 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"net/http"
++	"os"
+ 	"regexp"
+ 	"time"
+ )
+@@ -23,23 +24,45 @@ const ICloudBaseURL = "https://caldav.icloud.com"
+ // the Contacts transport, or vice versa.
+ const ContactsBaseURL = "https://contacts.icloud.com"
+ 
++// ICloudChinaBaseURL is the China mainland (icloud.com.cn) Calendar entry
++// point. icloud-mcp patch: China accounts are served from *.icloud.com.cn shards.
++const ICloudChinaBaseURL = "https://caldav.icloud.com.cn"
++
++// CalDAVBaseURLEnv selects the Calendar entry point. Only the two Apple
++// values are accepted; anything else is a configuration error.
++const CalDAVBaseURLEnv = "ICLOUD_CALDAV_BASE_URL"
++
++// CalDAVBaseURL returns the configured Calendar entry point (default
++// ICloudBaseURL). It never accepts an arbitrary URL.
++func CalDAVBaseURL() (string, error) {
++	switch v := os.Getenv(CalDAVBaseURLEnv); v {
++	case "", ICloudBaseURL:
++		return ICloudBaseURL, nil
++	case ICloudChinaBaseURL:
++		return ICloudChinaBaseURL, nil
++	default:
++		return "", fmt.Errorf("%s must be %s or %s", CalDAVBaseURLEnv, ICloudBaseURL, ICloudChinaBaseURL)
++	}
++}
++
+ // shardHostRe matches the shards returned by iCloud discovery
+-// (e.g. p46-caldav.icloud.com, p123-caldav.icloud.com).
+-var shardHostRe = regexp.MustCompile(`^p\d{1,3}-caldav\.icloud\.com$`)
++// (e.g. p46-caldav.icloud.com, p212-caldav.icloud.com.cn).
++var shardHostRe = regexp.MustCompile(`^p\d{1,3}-caldav\.icloud\.com(\.cn)?$`)
+ 
+-var contactsShardHostRe = regexp.MustCompile(`^p\d{1,3}-contacts\.icloud\.com$`)
++var contactsShardHostRe = regexp.MustCompile(`^p\d{1,3}-contacts\.icloud\.com(\.cn)?$`)
+ 
+-// IsICloudHost allows caldav.icloud.com and pXX-caldav.icloud.com, nothing
+-// else. The comparison is case-sensitive. url.URL.Hostname() preserves the
+-// case from the URL. Thus, this function rejects an uppercase variant.
++// IsICloudHost allows caldav.icloud.com(.cn) and pXX-caldav.icloud.com(.cn),
++// nothing else. The comparison is case-sensitive. url.URL.Hostname() preserves
++// the case from the URL. Thus, this function rejects an uppercase variant.
+ func IsICloudHost(host string) bool {
+-	return host == "caldav.icloud.com" || shardHostRe.MatchString(host)
++	return host == "caldav.icloud.com" || host == "caldav.icloud.com.cn" || shardHostRe.MatchString(host)
+ }
+ 
+-// IsContactsHost allows contacts.icloud.com and its one-to-three-digit iCloud
+-// Contacts shards, nothing else. Host matching is deliberately case-sensitive.
++// IsContactsHost allows contacts.icloud.com(.cn) and its one-to-three-digit
++// iCloud Contacts shards, nothing else. Host matching is deliberately
++// case-sensitive.
+ func IsContactsHost(host string) bool {
+-	return host == "contacts.icloud.com" || contactsShardHostRe.MatchString(host)
++	return host == "contacts.icloud.com" || host == "contacts.icloud.com.cn" || contactsShardHostRe.MatchString(host)
+ }
+ 
+ // PortAllowed accepts an empty port (implicit 443) or an explicit "443".
+diff --git a/internal/security/allowlist_test.go b/internal/security/allowlist_test.go
+index 05fb914..001be42 100644
+--- a/internal/security/allowlist_test.go
++++ b/internal/security/allowlist_test.go
+@@ -27,6 +27,14 @@ func TestIsICloudHost(t *testing.T) {
+ 		{"uppercase not normalized", "P46-CALDAV.ICLOUD.COM", false},
+ 		{"empty", "", false},
+ 		{"shard 4 digits rejected", "p1234-caldav.icloud.com", false},
++		// icloud-mcp patch: China mainland
++		{"china primary", "caldav.icloud.com.cn", true},
++		{"china shard", "p212-caldav.icloud.com.cn", true},
++		{"china shard 4 digits rejected", "p1234-caldav.icloud.com.cn", false},
++		{"china + malicious suffix", "p212-caldav.icloud.com.cn.evil.io", false},
++		{"china uppercase", "P212-CALDAV.ICLOUD.COM.CN", false},
++		{"other ccTLD", "p212-caldav.icloud.com.hk", false},
++		{"cn without com", "caldav.icloud.cn", false},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+diff --git a/internal/security/china_test.go b/internal/security/china_test.go
+new file mode 100644
+index 0000000..6a630a0
+--- /dev/null
++++ b/internal/security/china_test.go
+@@ -0,0 +1,42 @@
++package security
++
++import "testing"
++
++// icloud-mcp patch: China mainland entry point and Contacts hosts.
++func TestCalDAVBaseURL(t *testing.T) {
++	for _, tc := range []struct {
++		env, want string
++		ok        bool
++	}{
++		{"", ICloudBaseURL, true},
++		{"https://caldav.icloud.com", ICloudBaseURL, true},
++		{"https://caldav.icloud.com.cn", ICloudChinaBaseURL, true},
++		{"https://caldav.icloud.com.cn/", "", false},
++		{"http://caldav.icloud.com.cn", "", false},
++		{"https://evil.example", "", false},
++		{"https://p212-caldav.icloud.com.cn", "", false},
++	} {
++		t.Setenv(CalDAVBaseURLEnv, tc.env)
++		got, err := CalDAVBaseURL()
++		if (err == nil) != tc.ok || got != tc.want {
++			t.Errorf("%q: got %q err=%v", tc.env, got, err)
++		}
++	}
++}
++
++func TestIsContactsHostChina(t *testing.T) {
++	for host, want := range map[string]bool{
++		"contacts.icloud.com.cn":           true,
++		"p212-contacts.icloud.com.cn":      true,
++		"p212-contacts.icloud.com.cn.evil": false,
++		"P212-CONTACTS.ICLOUD.COM.CN":      false,
++		"p212-caldav.icloud.com.cn":        false,
++	} {
++		if got := IsContactsHost(host); got != want {
++			t.Errorf("IsContactsHost(%q) = %v, want %v", host, got, want)
++		}
++	}
++	if IsICloudHost("p212-contacts.icloud.com.cn") {
++		t.Error("calendar allowlist must not admit contacts hosts")
++	}
++}
